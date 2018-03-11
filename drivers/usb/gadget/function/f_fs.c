@@ -33,9 +33,9 @@
 #include <linux/poll.h>
 
 #include "u_fs.h"
-#include "u_f.h"
-#include "u_os_desc.h"
-#include "configfs.h"
+#include "../u_f.h"
+#include "../u_os_desc.h"
+#include "../configfs.h"
 
 #define FUNCTIONFS_MAGIC	0xa647361 /* Chosen by a honest dice roll ;) */
 
@@ -675,6 +675,7 @@ static void ffs_user_copy_worker(struct work_struct *work)
 
 	usb_ep_free_request(io_data->ep, io_data->req);
 
+	io_data->kiocb->private = NULL;
 	if (io_data->read)
 		kfree(io_data->iovec);
 	kfree(io_data->buf);

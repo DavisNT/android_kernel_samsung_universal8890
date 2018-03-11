@@ -23,6 +23,7 @@
 #include <linux/bitops.h>
 #include <linux/blkdev.h>
 #include <asm/byteorder.h>
+#include <linux/ratelimit.h>
 
 #include "ext4.h"
 #include "ext4_jbd2.h"
@@ -337,6 +338,9 @@ out:
 		if (!fatal)
 			fatal = err;
 	} else {
+		/* for debugging, sangwoo2.lee */
+		print_bh(sb, bitmap_bh, 0, EXT4_BLOCK_SIZE(sb));
+		/* for debugging */
 		ext4_error(sb, "bit already cleared for inode %lu", ino);
 		if (gdp && !EXT4_MB_GRP_IBITMAP_CORRUPT(grp)) {
 			int count;
@@ -727,24 +731,10 @@ struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
 	ext4_group_t i;
 	ext4_group_t flex_group;
 	struct ext4_group_info *grp;
-	int encrypt = 0;
 
 	/* Cannot create files in a deleted directory */
 	if (!dir || !dir->i_nlink)
 		return ERR_PTR(-EPERM);
-
-	if ((ext4_encrypted_inode(dir) ||
-	     DUMMY_ENCRYPTION_ENABLED(EXT4_SB(dir->i_sb))) &&
-	    (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode))) {
-		err = ext4_get_encryption_info(dir);
-		if (err)
-			return ERR_PTR(err);
-		if (ext4_encryption_info(dir) == NULL)
-			return ERR_PTR(-EPERM);
-		if (!handle)
-			nblocks += EXT4_DATA_TRANS_BLOCKS(dir->i_sb);
-		encrypt = 1;
-	}
 
 	sb = dir->i_sb;
 	ngroups = ext4_get_groups_count(sb);
@@ -790,8 +780,12 @@ struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
 got_group:
 	EXT4_I(dir)->i_last_alloc_group = group;
 	err = -ENOSPC;
-	if (ret2 == -1)
+	if (ret2 == -1) {
+		printk_ratelimited(KERN_INFO "Return ENOSPC : No free inode (%d/%u)\n",
+			(int) percpu_counter_read_positive(&sbi->s_freeinodes_counter),
+			le32_to_cpu(sbi->s_es->s_inodes_count));
 		goto out;
+	}
 
 	/*
 	 * Normally we will only go through one pass of this loop,
@@ -878,6 +872,9 @@ next_group:
 			group = 0;
 	}
 	err = -ENOSPC;
+	printk_ratelimited(KERN_INFO "Return ENOSPC : No free inode (%d/%u)\n",
+		(int) percpu_counter_read_positive(&sbi->s_freeinodes_counter),
+		le32_to_cpu(sbi->s_es->s_inodes_count));
 	goto out;
 
 got:
@@ -1043,9 +1040,11 @@ got:
 	ext4_set_inode_state(inode, EXT4_STATE_NEW);
 
 	ei->i_extra_isize = EXT4_SB(sb)->s_want_extra_isize;
+
 	ei->i_inline_off = 0;
 	if (EXT4_HAS_INCOMPAT_FEATURE(sb, EXT4_FEATURE_INCOMPAT_INLINE_DATA))
 		ext4_set_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA);
+
 	ret = inode;
 	err = dquot_alloc_inode(inode);
 	if (err)
@@ -1070,12 +1069,6 @@ got:
 	if (ext4_handle_valid(handle)) {
 		ei->i_sync_tid = handle->h_transaction->t_tid;
 		ei->i_datasync_tid = handle->h_transaction->t_tid;
-	}
-
-	if (encrypt) {
-		err = ext4_inherit_context(dir, inode);
-		if (err)
-			goto fail_free_drop;
 	}
 
 	err = ext4_mark_inode_dirty(handle, inode);

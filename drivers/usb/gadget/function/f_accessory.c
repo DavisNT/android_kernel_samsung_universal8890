@@ -41,6 +41,7 @@
 
 #include <linux/configfs.h>
 #include <linux/usb/composite.h>
+#include <linux/usb_notify.h>
 
 #define MAX_INST_NAME_LEN        40
 #define BULK_BUFFER_SIZE    16384
@@ -77,13 +78,9 @@ struct acc_dev {
 	struct usb_ep *ep_in;
 	struct usb_ep *ep_out;
 
-	/* online indicates state of function_set_alt & function_unbind
-	 * set to 1 when we connect
-	 */
+	/* set to 1 when we connect */
 	int online:1;
-
-	/* disconnected indicates state of open & release
-	 * Set to 1 when we disconnect.
+	/* Set to 1 when we disconnect.
 	 * Not cleared until our file is closed.
 	 */
 	int disconnected:1;
@@ -266,6 +263,7 @@ static struct usb_request *req_get(struct acc_dev *dev, struct list_head *head)
 
 static void acc_set_disconnected(struct acc_dev *dev)
 {
+	dev->online = 0;
 	dev->disconnected = 1;
 }
 
@@ -294,6 +292,13 @@ static void acc_complete_out(struct usb_ep *ep, struct usb_request *req)
 	}
 
 	wake_up(&dev->read_wq);
+}
+
+static void acc_ctrlrequest_complete(struct usb_ep *ep, struct usb_request *req)
+{
+	if (req->status != 0) {
+		pr_err("acc_ctrlrequest_complete, err %d\n", req->status);
+	}
 }
 
 static void acc_complete_set_string(struct usb_ep *ep, struct usb_request *req)
@@ -407,19 +412,12 @@ static void acc_hid_close(struct hid_device *hid)
 {
 }
 
-static int acc_hid_raw_request(struct hid_device *hid, unsigned char reportnum,
-	__u8 *buf, size_t len, unsigned char rtype, int reqtype)
-{
-	return 0;
-}
-
 static struct hid_ll_driver acc_hid_ll_driver = {
 	.parse = acc_hid_parse,
 	.start = acc_hid_start,
 	.stop = acc_hid_stop,
 	.open = acc_hid_open,
 	.close = acc_hid_close,
-	.raw_request = acc_hid_raw_request,
 };
 
 static struct acc_hid_dev *acc_hid_new(struct acc_dev *dev,
@@ -524,6 +522,15 @@ static int create_bulk_endpoints(struct acc_dev *dev,
 	DBG(cdev, "usb_ep_autoconfig for ep_in got %s\n", ep->name);
 	ep->driver_data = dev;		/* claim the endpoint */
 	dev->ep_in = ep;
+
+	ep = usb_ep_autoconfig(cdev->gadget, out_desc);
+	if (!ep) {
+		DBG(cdev, "usb_ep_autoconfig for ep_out failed\n");
+		return -ENODEV;
+	}
+	DBG(cdev, "usb_ep_autoconfig for ep_out got %s\n", ep->name);
+	ep->driver_data = dev;		/* claim the endpoint */
+	dev->ep_out = ep;
 
 	ep = usb_ep_autoconfig(cdev->gadget, out_desc);
 	if (!ep) {
@@ -765,10 +772,7 @@ static int acc_release(struct inode *ip, struct file *fp)
 	printk(KERN_INFO "acc_release\n");
 
 	WARN_ON(!atomic_xchg(&_acc_dev->open_excl, 0));
-	/* indicate that we are disconnected
-	 * still could be online so don't touch online flag
-	 */
-	_acc_dev->disconnected = 1;
+	_acc_dev->disconnected = 0;
 	return 0;
 }
 
@@ -830,6 +834,7 @@ int acc_ctrlrequest(struct usb_composite_dev *cdev,
 			b_requestType, b_request,
 			w_value, w_index, w_length);
 */
+	cdev->req->complete = acc_ctrlrequest_complete;
 
 	if (b_requestType == (USB_DIR_OUT | USB_TYPE_VENDOR)) {
 		if (b_request == ACCESSORY_START) {
@@ -969,6 +974,7 @@ __acc_function_bind(struct usb_configuration *c,
 	return 0;
 }
 
+
 static int
 acc_function_bind(struct usb_configuration *c, struct usb_function *f) {
 	return __acc_function_bind(c, f, false);
@@ -1021,10 +1027,6 @@ acc_function_unbind(struct usb_configuration *c, struct usb_function *f)
 	struct usb_request *req;
 	int i;
 
-	dev->online = 0;		/* clear online flag */
-	wake_up(&dev->read_wq);		/* unblock reads on closure */
-	wake_up(&dev->write_wq);	/* likewise for writes */
-
 	while ((req = req_get(dev, &dev->tx_idle)))
 		acc_request_free(req, dev->ep_in);
 	for (i = 0; i < RX_REQ_MAX; i++)
@@ -1037,6 +1039,9 @@ static void acc_start_work(struct work_struct *data)
 {
 	char *envp[2] = { "ACCESSORY=START", NULL };
 	kobject_uevent_env(&acc_device.this_device->kobj, KOBJ_CHANGE, envp);
+#ifdef CONFIG_USB_NOTIFY_PROC_LOG
+	store_usblog_notify(NOTIFY_USBSTATE, (void *)envp[0], NULL);
+#endif
 }
 
 static int acc_hid_init(struct acc_hid_dev *hdev)
@@ -1155,7 +1160,6 @@ static int acc_function_set_alt(struct usb_function *f,
 	}
 
 	dev->online = 1;
-	dev->disconnected = 0; /* if online then not disconnected */
 
 	/* readers may be blocked waiting for us to go online */
 	wake_up(&dev->read_wq);
@@ -1168,8 +1172,7 @@ static void acc_function_disable(struct usb_function *f)
 	struct usb_composite_dev	*cdev = dev->cdev;
 
 	DBG(cdev, "acc_function_disable\n");
-	acc_set_disconnected(dev); /* this now only sets disconnected */
-	dev->online = 0; /* so now need to clear online flag here too */
+	acc_set_disconnected(dev);
 	usb_ep_disable(dev->ep_in);
 	usb_ep_disable(dev->ep_out);
 
@@ -1178,6 +1181,7 @@ static void acc_function_disable(struct usb_function *f)
 
 	VDBG(cdev, "%s disabled\n", dev->function.name);
 }
+
 
 static int acc_bind_config(struct usb_configuration *c)
 {
@@ -1207,6 +1211,7 @@ static int acc_bind_config(struct usb_configuration *c)
 
 	return usb_add_function(c, &dev->function);
 }
+
 
 static int acc_setup(void)
 {
